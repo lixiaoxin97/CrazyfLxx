@@ -17,14 +17,24 @@ The binding also exposes "future quaternion" / "future delta", but the observed
 estimated robustly from consecutive Vicon orientation quaternions and their
 Vicon timestamps.
 
-Output:
+Output (after Vicon -> control-frame conversion):
   position       [m]
   roll/pitch/yaw [deg]
-  linear velocity[m/s]   -- directly from VRPN
+  linear velocity[m/s]
   body angular velocity estimate [rad/s] -- from quaternion finite difference
 
+Internal/control frame:
+  +X = forward
+  +Y = left
+  +Z = up
+
+Current raw Vicon frame:
+  +X = right
+  +Y = forward
+  +Z = up
+
 Example:
-    python3 vicon_state.py --tracker snowyowl3 --server 192.168.10.1
+    python3 vicon_state.py --tracker crazyflie --server 192.168.10.1
 
 Use Ctrl+C to stop.
 """
@@ -66,6 +76,73 @@ def quat_multiply(a, b):
         aw*bw - ax*bx - ay*by - az*bz,
     )
 
+
+
+# ----------------------------------------------------------------------
+# Vicon frame -> control / FlightLxx frame
+#
+# Vicon:
+#   +X = right
+#   +Y = forward
+#   +Z = up
+#
+# Control / FlightLxx / Crazyflie:
+#   +X = forward
+#   +Y = left
+#   +Z = up
+#
+# Coordinate mapping:
+#   x =  y_vicon
+#   y = -x_vicon
+#   z =  z_vicon
+#
+# This is a proper rotation: Rz(-90 deg).
+# ----------------------------------------------------------------------
+
+_SQRT_HALF = math.sqrt(0.5)
+
+Q_VICON_TO_CONTROL = (
+    0.0,
+    0.0,
+    -_SQRT_HALF,
+    _SQRT_HALF,
+)
+
+
+def vicon_vector_to_control(v):
+    """Transform a vector from the current Vicon frame to control frame."""
+    x, y, z = map(float, v)
+    return (
+        y,
+        -x,
+        z,
+    )
+
+
+def vicon_quaternion_to_control(q):
+    """
+    Transform a Vicon rigid-body orientation to the control frame.
+
+    The current Vicon rigid-body local axes are treated consistently with the
+    current Vicon world axes (X=right, Y=forward, Z=up), while the control/body
+    axes are X=forward, Y=left, Z=up.
+
+    Re-expressing both world and body coordinates gives:
+
+        R_control = C * R_vicon * C^T
+
+    where C = Rz(-90 deg).
+    """
+    q = quat_normalize(q)
+    if q is None:
+        return None
+
+    qc = Q_VICON_TO_CONTROL
+    q_control = quat_multiply(
+        quat_multiply(qc, q),
+        quat_conjugate(qc),
+    )
+    return quat_normalize(q_control)
 
 def quat_to_rpy_deg(q):
     """Quaternion [x,y,z,w] -> roll, pitch, yaw using ZYX convention."""
@@ -176,7 +253,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Read Vicon rigid-body state through VRPN."
     )
-    parser.add_argument("--tracker", default="snowyowl3",
+    parser.add_argument("--tracker", default="crazyflie",
                         help="Vicon rigid-body / VRPN tracker name")
     parser.add_argument("--server", default="192.168.10.1",
                         help="VRPN server hostname/IP, optionally host:port")
@@ -221,17 +298,19 @@ def main():
         if int(data.get("sensor", 0)) != args.sensor:
             return
 
-        p = data.get("position")
-        q = data.get("quaternion")
+        p_raw = data.get("position")
+        q_raw = data.get("quaternion")
         stamp = data.get("time")
 
-        if p is None or q is None:
+        if p_raw is None or q_raw is None:
             return
 
-        p = tuple(float(x) for x in p)
-        q = tuple(float(x) for x in q)
+        p = vicon_vector_to_control(p_raw)
+        q = vicon_quaternion_to_control(q_raw)
+        if q is None:
+            return
 
-        # Estimate angular velocity from consecutive ORIGINAL Vicon callbacks,
+        # Estimate angular velocity from consecutive converted Vicon callbacks,
         # not from the slower terminal printing loop.
         if previous["quaternion"] is not None and previous["timestamp"] is not None:
             dt = timestamp_dt_seconds(stamp, previous["timestamp"])
@@ -266,9 +345,9 @@ def main():
         if int(data.get("sensor", 0)) != args.sensor:
             return
 
-        v = data.get("velocity")
-        if v is not None:
-            state["linear_velocity"] = tuple(float(x) for x in v)
+        v_raw = data.get("velocity")
+        if v_raw is not None:
+            state["linear_velocity"] = vicon_vector_to_control(v_raw)
 
         state["velocity_timestamp"] = data.get("time")
         state["velocity_rx_monotonic"] = time.monotonic()
@@ -285,6 +364,7 @@ def main():
 
     print(f"VRPN tracker : {address}")
     print(f"sensor       : {args.sensor}")
+    print("frame        : +X forward, +Y left, +Z up")
     print("angular rate : quaternion finite difference (body-frame estimate)")
     print("Ctrl+C to stop\n")
 

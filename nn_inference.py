@@ -136,7 +136,7 @@ def main():
     )
 
     # Real VRPN
-    parser.add_argument("--tracker", default="snowyowl3")
+    parser.add_argument("--tracker", default="crazyflie")
     parser.add_argument("--server", default="192.168.10.1")
 
     # Mock UDP

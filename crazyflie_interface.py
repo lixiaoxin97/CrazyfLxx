@@ -52,17 +52,17 @@ and internally interprets the motor thrust command approximately as:
 before battery-voltage compensation.
 
 Vehicle mass for the current experiment:
-    38.7 g = 0.0387 kg
+    42.9 g = 0.0429 kg
 
 At 1 g:
-    total thrust ~= 0.379647 N
-    per motor    ~= 0.094912 N
-    uint16 thrust ~= 51834
+    total thrust ~= 0.420849 N
+    per motor    ~= 0.105212 N
+    uint16 thrust ~= 57459
 
 Because the vehicle is relatively heavy for legacy props, the theoretical
 maximum mass-normalized collective thrust using THRUST_MAX=0.12 N/motor is:
 
-    4 * 0.12 / 0.0387 ~= 12.4031 m/s^2
+    4 * 0.12 / 0.0429 ~= 11.1888 m/s^2
 
 Any higher FlightLxx collective-thrust request must saturate on this hardware.
 
@@ -87,7 +87,7 @@ import time
 
 UINT16_MAX = 65535
 
-DEFAULT_MASS_KG = 0.0387
+DEFAULT_MASS_KG = 0.0429
 
 # Current Bitcraze legacy-propeller profile.
 LEGACY_THRUST_MAX_PER_MOTOR_N = 0.12
@@ -597,8 +597,8 @@ def main():
     parser.add_argument(
         "--mass-g",
         type=float,
-        default=38.7,
-        help="all-up vehicle mass [g]; default 38.7",
+        default=42.9,
+        help="all-up vehicle mass [g]; default 42.9",
     )
 
     parser.add_argument(

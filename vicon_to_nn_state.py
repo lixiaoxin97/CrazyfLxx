@@ -18,6 +18,23 @@ Both sources feed exactly the same state-processing path.
 
 FlightLxx observation order:
     [x, y, z, yaw, pitch, roll, vx, vy, vz, wx, wy, wz]
+
+Coordinate convention used internally by CrazyfLxx:
+    +X = forward
+    +Y = left
+    +Z = up
+
+Current Vicon world/rigid-body axes:
+    +X = right
+    +Y = forward
+    +Z = up
+
+Real VRPN input is converted once at the VrpnSource boundary:
+    x_control =  y_vicon
+    y_control = -x_vicon
+    z_control =  z_vicon
+
+Mock input is assumed to already use the internal/control convention.
 """
 
 import argparse
@@ -62,6 +79,73 @@ def quat_multiply(a, b):
         aw*bw - ax*bx - ay*by - az*bz,
     )
 
+
+
+# ----------------------------------------------------------------------
+# Vicon frame -> control / FlightLxx frame
+#
+# Vicon:
+#   +X = right
+#   +Y = forward
+#   +Z = up
+#
+# Control / FlightLxx / Crazyflie:
+#   +X = forward
+#   +Y = left
+#   +Z = up
+#
+# Coordinate mapping:
+#   x =  y_vicon
+#   y = -x_vicon
+#   z =  z_vicon
+#
+# This is a proper rotation: Rz(-90 deg).
+# ----------------------------------------------------------------------
+
+_SQRT_HALF = math.sqrt(0.5)
+
+Q_VICON_TO_CONTROL = (
+    0.0,
+    0.0,
+    -_SQRT_HALF,
+    _SQRT_HALF,
+)
+
+
+def vicon_vector_to_control(v):
+    """Transform a vector from the current Vicon frame to control frame."""
+    x, y, z = map(float, v)
+    return (
+        y,
+        -x,
+        z,
+    )
+
+
+def vicon_quaternion_to_control(q):
+    """
+    Transform a Vicon rigid-body orientation to the control frame.
+
+    The current Vicon rigid-body local axes are treated consistently with the
+    current Vicon world axes (X=right, Y=forward, Z=up), while the control/body
+    axes are X=forward, Y=left, Z=up.
+
+    Re-expressing both world and body coordinates gives:
+
+        R_control = C * R_vicon * C^T
+
+    where C = Rz(-90 deg).
+    """
+    q = quat_normalize(q)
+    if q is None:
+        return None
+
+    qc = Q_VICON_TO_CONTROL
+    q_control = quat_multiply(
+        quat_multiply(qc, q),
+        quat_conjugate(qc),
+    )
+    return quat_normalize(q_control)
 
 def quat_to_euler_zyx_rad(q):
     """
@@ -310,11 +394,17 @@ class VrpnSource:
         if int(data.get("sensor", 0)) != self.sensor:
             return
 
-        p = data.get("position")
-        q = data.get("quaternion")
+        p_raw = data.get("position")
+        q_raw = data.get("quaternion")
         stamp = data.get("time")
 
-        if p is None or q is None or stamp is None:
+        if p_raw is None or q_raw is None or stamp is None:
+            return
+
+        p = vicon_vector_to_control(p_raw)
+        q = vicon_quaternion_to_control(q_raw)
+
+        if q is None:
             return
 
         update_pose(
@@ -329,12 +419,13 @@ class VrpnSource:
         if int(data.get("sensor", 0)) != self.sensor:
             return
 
-        v = data.get("velocity")
+        v_raw = data.get("velocity")
         stamp = data.get("time")
 
-        if v is None or stamp is None:
+        if v_raw is None or stamp is None:
             return
 
+        v = vicon_vector_to_control(v_raw)
         update_velocity(self.state, v, stamp)
 
         # Deliberately ignore "future quaternion"/"future delta".
@@ -436,7 +527,7 @@ def main():
 
     parser.add_argument(
         "--tracker",
-        default="snowyowl3",
+        default="crazyflie",
         help="VRPN tracker name",
     )
     parser.add_argument(
