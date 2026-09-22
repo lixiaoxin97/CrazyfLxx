@@ -48,6 +48,13 @@ from datetime import datetime
 import numpy as np
 
 
+# A Crazyflie can rotate quickly, but a single Vicon sample implying hundreds
+# of rad/s is a tracking/packet outlier rather than a physically plausible
+# motion. Rejected samples leave the last valid pose in the state.
+MAX_POSE_ANGULAR_RATE_RAD_S = 20.0
+MAX_POSE_LINEAR_RATE_M_S = 8.0
+
+
 # ----------------------------------------------------------------------
 # Quaternion helpers -- convention: [x, y, z, w]
 # ----------------------------------------------------------------------
@@ -250,11 +257,13 @@ def make_state():
         "pose_rx_monotonic": None,
         "velocity_rx_monotonic": None,
         "pose_dt": None,
+        "pose_outlier": False,
     }
 
 
 def make_previous_pose():
     return {
+        "position": None,
         "quaternion": None,
         "timestamp": None,
     }
@@ -262,8 +271,13 @@ def make_previous_pose():
 
 def update_pose(state, previous_pose, position, quaternion, timestamp):
     p = tuple(float(x) for x in position)
-    q = tuple(float(x) for x in quaternion)
+    q = quat_normalize(quaternion)
+    if q is None or timestamp is None:
+        state["pose_outlier"] = True
+        return False
 
+    dt = None
+    omega = None
     if (
         previous_pose["quaternion"] is not None
         and previous_pose["timestamp"] is not None
@@ -276,16 +290,37 @@ def update_pose(state, previous_pose, position, quaternion, timestamp):
                 q,
                 dt,
             )
-            if omega is not None:
-                state["omega_body_est"] = omega
-                state["pose_dt"] = dt
-            else:
-                state["omega_body_est"] = None
-                state["pose_dt"] = None
-        else:
-            state["omega_body_est"] = None
-            state["pose_dt"] = None
+            if omega is None:
+                state["pose_outlier"] = True
+                return False
 
+            omega_norm = math.sqrt(sum(value * value for value in omega))
+            if omega_norm > MAX_POSE_ANGULAR_RATE_RAD_S:
+                state["pose_outlier"] = True
+                return False
+
+            previous_position = previous_pose.get("position")
+            if previous_position is not None:
+                displacement = math.sqrt(
+                    sum(
+                        (p[index] - previous_position[index]) ** 2
+                        for index in range(3)
+                    )
+                )
+                if displacement / dt > MAX_POSE_LINEAR_RATE_M_S:
+                    state["pose_outlier"] = True
+                    return False
+
+    state["pose_outlier"] = False
+
+    if omega is not None:
+        state["omega_body_est"] = omega
+        state["pose_dt"] = dt
+    else:
+        state["omega_body_est"] = None
+        state["pose_dt"] = None
+
+    previous_pose["position"] = p
     previous_pose["quaternion"] = q
     previous_pose["timestamp"] = timestamp
 
@@ -293,12 +328,20 @@ def update_pose(state, previous_pose, position, quaternion, timestamp):
     state["quaternion"] = q
     state["pose_timestamp"] = timestamp
     state["pose_rx_monotonic"] = time.monotonic()
+    return True
 
 
 def update_velocity(state, velocity, timestamp):
+    # Position and velocity packets are emitted as one Vicon sample. If the
+    # pose packet was rejected, keep the previous velocity with it instead of
+    # pairing a possibly corrupted velocity with the last valid pose.
+    if state.get("pose_outlier", False):
+        return False
+
     state["linear_velocity"] = tuple(float(x) for x in velocity)
     state["velocity_timestamp"] = timestamp
     state["velocity_rx_monotonic"] = time.monotonic()
+    return True
 
 
 # ----------------------------------------------------------------------

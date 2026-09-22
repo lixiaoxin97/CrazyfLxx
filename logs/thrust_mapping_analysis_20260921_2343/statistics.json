@@ -1,0 +1,40 @@
+{
+  "source": "logs/nn_compare.csv",
+  "sha256": "705ec5ffd1a9abd6223755af4654b21e32e13d99027f1207872552320443de45",
+  "samples": 3743,
+  "duration_s": 74.84063678900566,
+  "mass_kg_assumed": 0.0429,
+  "current_hover_uint16": 57459.04003125001,
+  "proposed_hover_uint16_for_review": 46000,
+  "firmware_verified": false,
+  "windows": [
+    {
+      "label": "CTBR+ID 1",
+      "start_s": 34.000496213004226,
+      "end_s": 37.981218799999624,
+      "n": 200,
+      "mean_height_m": 1.42434828209952,
+      "height_std_m": 0.015213974519082466,
+      "height_trend_m_s": 0.004676307231809628,
+      "mean_vz_m_s": 0.002424507499466211,
+      "mean_uint16_time_weighted": 45202.182692171555,
+      "mean_requested_accel_time_weighted": 7.717378348215514,
+      "mean_cos_roll_cos_pitch": 0.9997677637893295,
+      "relative_to_current_hover": 0.7866853095281026
+    },
+    {
+      "label": "CTBR+ID 2",
+      "start_s": 64.00054147500487,
+      "end_s": 68.78047512200283,
+      "n": 240,
+      "mean_height_m": 1.3717150969418612,
+      "height_std_m": 0.023236187633860633,
+      "height_trend_m_s": 0.0008301285858692541,
+      "mean_vz_m_s": 0.01206253804996856,
+      "mean_uint16_time_weighted": 46523.53670321848,
+      "mean_requested_accel_time_weighted": 7.942979847472919,
+      "mean_cos_roll_cos_pitch": 0.9994648835806413,
+      "relative_to_current_hover": 0.8096817607449744
+    }
+  ]
+}

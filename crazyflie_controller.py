@@ -71,6 +71,7 @@ import numpy as np
 
 from action_converter import convert_action
 from crazyflie_interface import CrazyflieInterface
+from experiment_data_logger import ExperimentDataLogger
 from vicon_to_nn_state import (
     MockUdpSource,
     VrpnSource,
@@ -90,6 +91,16 @@ STATE_RETURN_POSITION = "RETURN_POSITION"
 STATE_NN = "NN_CONTROL"
 STATE_LANDING = "LANDING"
 STATE_STOPPED = "STOPPED"
+
+POLICY_NAMES = ("CTBR", "CTBR+DR", "CTBR+ID")
+POLICY_COMMANDS = {
+    "nn1": "CTBR",
+    "n1": "CTBR",
+    "nn2": "CTBR+DR",
+    "n2": "CTBR+DR",
+    "nn3": "CTBR+ID",
+    "n3": "CTBR+ID",
+}
 
 
 def add_flightlxx_to_python_path(explicit_path=None):
@@ -134,6 +145,33 @@ def load_policy(model_name, model_path=None):
 
     model = PPO2.load(model_path)
     return model, model_path
+
+
+def load_policies(initial_model_name, initial_model_path=None):
+    """Load all policies before opening the radio link.
+
+    ``--model-path`` remains an override for the policy selected by
+    ``--model``.  The other policies use FlightLxx's normal
+    ``get_model_weight`` lookup, so ``nn1``/``nn2``/``nn3`` can switch without
+    loading a TensorFlow graph during flight.
+    """
+    models = {}
+    model_paths = {}
+
+    for model_name in POLICY_NAMES:
+        explicit_path = (
+            initial_model_path
+            if model_name == initial_model_name
+            else None
+        )
+        model, model_path = load_policy(
+            model_name=model_name,
+            model_path=explicit_path,
+        )
+        models[model_name] = model
+        model_paths[model_name] = model_path
+
+    return models, model_paths
 
 
 def data_age_ms(state, now):
@@ -420,18 +458,25 @@ class CrazyfLxxController(object):
         args,
         model,
         model_path,
+        models,
+        model_paths,
         source,
         state,
         hardware,
         flight_link,
+        logger=None,
     ):
         self.args = args
         self.model = model
         self.model_path = model_path
+        self.models = models
+        self.model_paths = model_paths
+        self.model_name = args.model
         self.source = source
         self.state = state
         self.hardware = hardware
         self.link = flight_link
+        self.logger = logger
 
         self.mode = STATE_DISARMED
         self.running = True
@@ -458,6 +503,7 @@ class CrazyfLxxController(object):
         self.last_supervisor_check = 0.0
 
         self.vicon_soft_fault_active = False
+        self.hard_geofence_violation_start_time = None
 
     # ------------------------------------------------------------------
     # Vicon / EKF setup
@@ -767,7 +813,7 @@ class CrazyfLxxController(object):
 
         return True, "OK"
 
-    def command_nn(self):
+    def command_nn(self, model_name=None):
         if self.mode != STATE_POSITION_HOLD:
             print(
                 "NN rejected: first stabilize in POSITION_HOLD; "
@@ -780,18 +826,28 @@ class CrazyfLxxController(object):
             print("NN rejected: Vicon state is not fresh")
             return
 
+        if model_name is None:
+            model_name = self.args.model
+
+        if model_name not in self.models:
+            print("NN rejected: unknown model %s" % model_name)
+            return
+
         safe, reason = self.nn_entry_is_safe()
         if not safe:
             print("NN rejected:", reason)
             return
 
+        self.model_name = model_name
+        self.model = self.models[model_name]
+        self.model_path = self.model_paths.get(model_name)
         self.nn_start_time = time.monotonic()
         self.nn_saturation_start = None
         self.last_nn_raw_action = None
         self.last_nn_info = None
 
         self.set_mode(STATE_NN)
-        print("NN model active:", self.args.model)
+        print("NN model active:", self.model_name)
         print("Use 'position' to disable NN and return to hover.")
 
     def command_position(self, automatic_reason=None):
@@ -1151,19 +1207,42 @@ class CrazyfLxxController(object):
         x, y, z = p
         yaw, pitch, roll = ypr
 
-        # Hard bounds: stop the experiment.
-        if (
-            abs(x) > self.args.hard_xy_limit
-            or abs(y) > self.args.hard_xy_limit
-            or z > self.args.hard_z_max
-            or z < self.args.hard_z_min
-            or abs(math.degrees(roll)) > self.args.hard_tilt_deg
-            or abs(math.degrees(pitch)) > self.args.hard_tilt_deg
-        ):
+        # Hard bounds: require a short continuous violation. The Vicon stream
+        # can occasionally contain one corrupted quaternion; a real tilt or
+        # position excursion persists across several samples.
+        hard_violations = []
+        if abs(x) > self.args.hard_xy_limit:
+            hard_violations.append("x=%.3f" % x)
+        if abs(y) > self.args.hard_xy_limit:
+            hard_violations.append("y=%.3f" % y)
+        if z > self.args.hard_z_max:
+            hard_violations.append("z=%.3f" % z)
+        if z < self.args.hard_z_min:
+            hard_violations.append("z=%.3f" % z)
+        if abs(math.degrees(roll)) > self.args.hard_tilt_deg:
+            hard_violations.append("roll=%.1fdeg" % math.degrees(roll))
+        if abs(math.degrees(pitch)) > self.args.hard_tilt_deg:
+            hard_violations.append("pitch=%.1fdeg" % math.degrees(pitch))
+
+        if hard_violations:
+            now = time.monotonic()
+            if self.hard_geofence_violation_start_time is None:
+                self.hard_geofence_violation_start_time = now
+                return
+
+            if (
+                now - self.hard_geofence_violation_start_time
+                < self.args.hard_geofence_grace_s
+            ):
+                return
+
             self.emergency_stop(
-                "hard flight-envelope violation"
+                "hard flight-envelope violation: %s"
+                % ", ".join(hard_violations)
             )
             return
+
+        self.hard_geofence_violation_start_time = None
 
         # Softer NN-only boundary: give control back to the onboard
         # position controller.
@@ -1213,7 +1292,10 @@ class CrazyfLxxController(object):
         print("--------")
         print("  arm / a       arm + low-thrust motor idle")
         print("  takeoff / t   position-control takeoff to hover")
-        print("  nn / n        enable selected FlightLxx policy")
+        print("  nn / n        enable policy selected by --model")
+        print("  nn1 / n1      enable CTBR")
+        print("  nn2 / n2      enable CTBR+DR")
+        print("  nn3 / n3      enable CTBR+ID")
         print("  position / p  disable NN and return to hover")
         print("  land / l      position-control landing + disarm")
         print("  stop          immediate normal STOP + disarm")
@@ -1222,10 +1304,8 @@ class CrazyfLxxController(object):
         print("  help / h      show commands")
         print("  quit / q      exit only when disarmed/stopped")
         print()
-        print(
-            "Selected NN model: %s"
-            % self.args.model
-        )
+        print("Default NN model: %s" % self.args.model)
+        print("Loaded NN models: %s" % ", ".join(POLICY_NAMES))
         print()
 
     def read_command(self):
@@ -1261,6 +1341,9 @@ class CrazyfLxxController(object):
 
         elif command in ("nn", "n"):
             self.command_nn()
+
+        elif command in POLICY_COMMANDS:
+            self.command_nn(POLICY_COMMANDS[command])
 
         elif command in ("position", "p", "pos"):
             self.command_position()
@@ -1340,6 +1423,9 @@ class CrazyfLxxController(object):
                 vel_age_ms,
             )
         )
+
+        if self.mode == STATE_NN:
+            text += " model=%s" % self.model_name
 
         if (
             self.mode == STATE_NN
@@ -1443,6 +1529,9 @@ class CrazyfLxxController(object):
 
                     elif self.mode == STATE_LANDING:
                         self.update_landing(now)
+
+                    if self.logger is not None:
+                        self.logger.write_controller_sample(self, now)
 
                 self.print_status(now)
                 time.sleep(0.001)
@@ -1739,11 +1828,28 @@ def build_arg_parser():
         type=float,
         default=70.0,
     )
+    parser.add_argument(
+        "--hard-geofence-grace-s",
+        type=float,
+        default=0.08,
+        help=(
+            "continuous hard-envelope violation time before emergency stop; "
+            "default 0.08 s"
+        ),
+    )
 
     parser.add_argument(
         "--status-period-s",
         type=float,
         default=0.5,
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help=(
+            "optional CSV path for controller/state/action logging; "
+            "disabled by default"
+        ),
     )
 
     return parser
@@ -1765,6 +1871,7 @@ def validate_args(parser, args):
         "hard_xy_limit",
         "hard_z_max",
         "hard_tilt_deg",
+        "hard_geofence_grace_s",
     )
 
     for name in positive:
@@ -1841,13 +1948,19 @@ def main():
         args.flightlxx_path
     )
 
-    model, model_path = load_policy(
-        model_name=args.model,
-        model_path=args.model_path,
+    models, model_paths = load_policies(
+        initial_model_name=args.model,
+        initial_model_path=args.model_path,
     )
+    model = models[args.model]
+    model_path = model_paths[args.model]
 
     print("FlightLxx root:", flightlxx_root)
-    print("Model path    :", model_path)
+    for policy_name in POLICY_NAMES:
+        print(
+            "%-13s: %s"
+            % (policy_name + " model", model_paths[policy_name])
+        )
 
     state = make_state()
     previous_pose = make_previous_pose()
@@ -1858,6 +1971,11 @@ def main():
     )
 
     print("Vicon source  :", source.description())
+
+    logger = None
+    if args.log_file:
+        logger = ExperimentDataLogger(args.log_file)
+        print("CSV log file  :", logger.path)
 
     hardware = CrazyflieInterface(
         uri=args.uri,
@@ -1874,10 +1992,13 @@ def main():
         args=args,
         model=model,
         model_path=model_path,
+        models=models,
+        model_paths=model_paths,
         source=source,
         state=state,
         hardware=hardware,
         flight_link=link,
+        logger=logger,
     )
 
     try:
@@ -1911,9 +2032,13 @@ def main():
             try:
                 hardware.close()
             finally:
-                close_fn = getattr(source, "close", None)
-                if callable(close_fn):
-                    close_fn()
+                try:
+                    if logger is not None:
+                        logger.close()
+                finally:
+                    close_fn = getattr(source, "close", None)
+                    if callable(close_fn):
+                        close_fn()
 
     return 0
 
