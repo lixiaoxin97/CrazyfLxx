@@ -174,6 +174,54 @@ def load_policies(initial_model_name, initial_model_path=None):
     return models, model_paths
 
 
+def warmup_policies(models, nn_goal, repeats=3):
+    """Warm every policy before the Crazyflie radio link is opened."""
+    repeats = int(repeats)
+    if repeats < 2:
+        raise ValueError("NN warm-up repeats must be >= 2")
+
+    # build_nn_observation() maps the physical hover position to nn_goal.
+    # A level, stationary synthetic hover is sufficient to execute all lazy
+    # TensorFlow initialization without sending any command to the vehicle.
+    obs = np.zeros((1, 12), dtype=np.float32)
+    obs[0, 0:3] = np.asarray(nn_goal, dtype=np.float32)
+
+    print()
+    print("Warming up NN models...")
+
+    for model_name in POLICY_NAMES:
+        elapsed_ms = []
+
+        for _ in range(repeats):
+            start = time.perf_counter()
+            action, _ = models[model_name].predict(
+                obs,
+                deterministic=True,
+            )
+            elapsed_ms.append(
+                1000.0 * (time.perf_counter() - start)
+            )
+
+            action = np.asarray(action, dtype=np.float32).reshape(-1)
+            if action.size != 4 or not np.all(np.isfinite(action)):
+                raise RuntimeError(
+                    "NN warm-up failed for %s: action=%r"
+                    % (model_name, action)
+                )
+
+        print(
+            "  %-8s first=%6.1f ms, steady=%6.1f ms"
+            % (
+                model_name,
+                elapsed_ms[0],
+                max(elapsed_ms[1:]),
+            )
+        )
+
+    print("NN warm-up complete.")
+    print()
+
+
 def data_age_ms(state, now):
     pose_age = (
         1000.0 * (now - state["pose_rx_monotonic"])
@@ -505,6 +553,12 @@ class CrazyfLxxController(object):
         self.vicon_soft_fault_active = False
         self.hard_geofence_violation_start_time = None
 
+        # Each external-pose sample must be fused at most once.  The control
+        # loop runs faster than the VRPN stream, and repeatedly submitting the
+        # same timestamp would make the EKF treat one stale measurement as
+        # multiple independent measurements.
+        self.last_vicon_sent_pose_timestamp = None
+
     # ------------------------------------------------------------------
     # Vicon / EKF setup
     # ------------------------------------------------------------------
@@ -550,20 +604,30 @@ class CrazyfLxxController(object):
         if self.state["pose_rx_monotonic"] is None:
             return
 
+        pose_timestamp = self.state.get("pose_timestamp")
+        if pose_timestamp is None:
+            return
+
+        # The scheduler may call this function several times between two VRPN
+        # callbacks. Never send the same Vicon sample to the EKF twice.
+        if pose_timestamp == self.last_vicon_sent_pose_timestamp:
+            return
+
         pose_age_ms = 1000.0 * (
             now - self.state["pose_rx_monotonic"]
         )
 
-        # Never keep re-sending an old mocap sample to the EKF.
-        # Once the pose is older than the soft timeout, let the onboard
+        # Once a newly received pose is already too old, let the onboard
         # estimator coast on its IMU until Vicon recovers.
         if pose_age_ms > self.args.vicon_soft_timeout_ms:
             return
 
-        self.link.send_external_measurement(
+        sent = self.link.send_external_measurement(
             self.state,
             self.args.vicon_fusion,
         )
+        if sent:
+            self.last_vicon_sent_pose_timestamp = pose_timestamp
 
     def wait_for_initial_vicon(self):
         print()
@@ -1071,7 +1135,7 @@ class CrazyfLxxController(object):
         self.last_nn_info = info
 
         # Persistent physical thrust saturation is a sign that the learned
-        # controller is asking more than this 42.9 g legacy-prop vehicle
+        # controller is asking more than this 47.2 g legacy-prop vehicle
         # can produce. Fall back to position control rather than stay pinned.
         if info["thrust_saturated"]:
             if self.nn_saturation_start is None:
@@ -1622,10 +1686,11 @@ def build_arg_parser():
     parser.add_argument(
         "--vicon-fusion",
         choices=("pose", "position"),
-        default="pose",
+        default="position",
         help=(
             "send full Vicon pose or only position to the "
-            "Crazyflie EKF; default pose"
+            "Crazyflie EKF; default position because delayed external "
+            "attitude destabilizes the onboard attitude loop"
         ),
     )
 
@@ -1637,7 +1702,7 @@ def build_arg_parser():
     parser.add_argument(
         "--mass-g",
         type=float,
-        default=42.9,
+        default=47.2,
     )
     parser.add_argument(
         "--live",
@@ -1952,6 +2017,15 @@ def main():
         initial_model_name=args.model,
         initial_model_path=args.model_path,
     )
+
+    # Execute each TensorFlow graph before connecting to the vehicle. This
+    # removes the large one-time predict() latency observed on first NN entry.
+    warmup_policies(
+        models=models,
+        nn_goal=args.nn_goal,
+        repeats=3,
+    )
+
     model = models[args.model]
     model_path = model_paths[args.model]
 
@@ -1982,7 +2056,7 @@ def main():
         mass_kg=args.mass_kg,
         dry_run=not args.live,
         roll_sign=1.0,
-        pitch_sign=-1.0,
+        pitch_sign=1.0,
         yaw_sign=1.0,
     )
 

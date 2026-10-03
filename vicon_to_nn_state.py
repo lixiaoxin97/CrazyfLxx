@@ -25,14 +25,12 @@ Coordinate convention used internally by CrazyfLxx:
     +Z = up
 
 Current Vicon world/rigid-body axes:
-    +X = right
-    +Y = forward
+    +X = forward
+    +Y = left
     +Z = up
 
-Real VRPN input is converted once at the VrpnSource boundary:
-    x_control =  y_vicon
-    y_control = -x_vicon
-    z_control =  z_vicon
+Real VRPN input already uses the internal/control convention and is passed
+through unchanged at the VrpnSource boundary.
 
 Mock input is assumed to already use the internal/control convention.
 """
@@ -40,8 +38,10 @@ Mock input is assumed to already use the internal/control convention.
 import argparse
 import json
 import math
+import queue
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -92,8 +92,8 @@ def quat_multiply(a, b):
 # Vicon frame -> control / FlightLxx frame
 #
 # Vicon:
-#   +X = right
-#   +Y = forward
+#   +X = forward
+#   +Y = left
 #   +Z = up
 #
 # Control / FlightLxx / Crazyflie:
@@ -101,58 +101,31 @@ def quat_multiply(a, b):
 #   +Y = left
 #   +Z = up
 #
-# Coordinate mapping:
-#   x =  y_vicon
-#   y = -x_vicon
-#   z =  z_vicon
-#
-# This is a proper rotation: Rz(-90 deg).
+# The Vicon world and rigid-body axes are now calibrated to this same FLU
+# convention, so the boundary transform is the identity.
 # ----------------------------------------------------------------------
 
-_SQRT_HALF = math.sqrt(0.5)
-
-Q_VICON_TO_CONTROL = (
-    0.0,
-    0.0,
-    -_SQRT_HALF,
-    _SQRT_HALF,
-)
+Q_VICON_TO_CONTROL = (0.0, 0.0, 0.0, 1.0)
 
 
 def vicon_vector_to_control(v):
-    """Transform a vector from the current Vicon frame to control frame."""
-    x, y, z = map(float, v)
-    return (
-        y,
-        -x,
-        z,
-    )
+    """Pass a vector from the calibrated Vicon FLU frame through unchanged."""
+    return tuple(float(value) for value in v)
 
 
 def vicon_quaternion_to_control(q):
     """
     Transform a Vicon rigid-body orientation to the control frame.
 
-    The current Vicon rigid-body local axes are treated consistently with the
-    current Vicon world axes (X=right, Y=forward, Z=up), while the control/body
-    axes are X=forward, Y=left, Z=up.
-
-    Re-expressing both world and body coordinates gives:
-
-        R_control = C * R_vicon * C^T
-
-    where C = Rz(-90 deg).
+    The current Vicon rigid-body/world axes are calibrated directly as
+    X=forward, Y=left, Z=up, which is the FlightLxx/Crazyflie internal FLU
+    convention. Only normalization is needed here.
     """
     q = quat_normalize(q)
     if q is None:
         return None
 
-    qc = Q_VICON_TO_CONTROL
-    q_control = quat_multiply(
-        quat_multiply(qc, q),
-        quat_conjugate(qc),
-    )
-    return quat_normalize(q_control)
+    return q
 
 def quat_to_euler_zyx_rad(q):
     """
@@ -269,7 +242,14 @@ def make_previous_pose():
     }
 
 
-def update_pose(state, previous_pose, position, quaternion, timestamp):
+def update_pose(
+    state,
+    previous_pose,
+    position,
+    quaternion,
+    timestamp,
+    received_monotonic=None,
+):
     p = tuple(float(x) for x in position)
     q = quat_normalize(quaternion)
     if q is None or timestamp is None:
@@ -327,11 +307,20 @@ def update_pose(state, previous_pose, position, quaternion, timestamp):
     state["position"] = p
     state["quaternion"] = q
     state["pose_timestamp"] = timestamp
-    state["pose_rx_monotonic"] = time.monotonic()
+    state["pose_rx_monotonic"] = (
+        time.monotonic()
+        if received_monotonic is None
+        else float(received_monotonic)
+    )
     return True
 
 
-def update_velocity(state, velocity, timestamp):
+def update_velocity(
+    state,
+    velocity,
+    timestamp,
+    received_monotonic=None,
+):
     # Position and velocity packets are emitted as one Vicon sample. If the
     # pose packet was rejected, keep the previous velocity with it instead of
     # pairing a possibly corrupted velocity with the last valid pose.
@@ -340,7 +329,11 @@ def update_velocity(state, velocity, timestamp):
 
     state["linear_velocity"] = tuple(float(x) for x in velocity)
     state["velocity_timestamp"] = timestamp
-    state["velocity_rx_monotonic"] = time.monotonic()
+    state["velocity_rx_monotonic"] = (
+        time.monotonic()
+        if received_monotonic is None
+        else float(received_monotonic)
+    )
     return True
 
 
@@ -422,6 +415,10 @@ class VrpnSource:
         self.state = state
         self.previous_pose = previous_pose
         self.sensor = sensor
+        self._events = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread_error = None
+        self._closed = False
 
         self.address = f"{tracker_name}@{server}"
         self.tracker = vrpn.receiver.Tracker(self.address)
@@ -432,6 +429,17 @@ class VrpnSource:
         self.tracker.register_change_handler(
             None, self._on_velocity, "velocity"
         )
+
+        # The VRPN binding only dispatches callbacks while mainloop() runs.
+        # Keep it independent of TensorFlow inference, CSV I/O and the flight
+        # control loop. Callbacks enqueue immutable samples; poll() applies
+        # them to the controller state on the main thread.
+        self._thread = threading.Thread(
+            target=self._receive_loop,
+            name="CrazyfLxx-VRPN",
+            daemon=True,
+        )
+        self._thread.start()
 
     def _on_position(self, userdata, data):
         if int(data.get("sensor", 0)) != self.sensor:
@@ -450,12 +458,14 @@ class VrpnSource:
         if q is None:
             return
 
-        update_pose(
-            self.state,
-            self.previous_pose,
-            p,
-            q,
-            stamp,
+        self._events.put(
+            (
+                "pose",
+                p,
+                q,
+                stamp,
+                time.monotonic(),
+            )
         )
 
     def _on_velocity(self, userdata, data):
@@ -469,15 +479,72 @@ class VrpnSource:
             return
 
         v = vicon_vector_to_control(v_raw)
-        update_velocity(self.state, v, stamp)
+        self._events.put(
+            (
+                "velocity",
+                v,
+                stamp,
+                time.monotonic(),
+            )
+        )
 
         # Deliberately ignore "future quaternion"/"future delta".
 
+    def _receive_loop(self):
+        try:
+            while not self._stop_event.is_set():
+                self.tracker.mainloop()
+                # Avoid a CPU-burning busy loop while still servicing VRPN at
+                # a rate far above the 50-100 Hz tracking stream.
+                self._stop_event.wait(0.0005)
+        except BaseException as exc:
+            self._thread_error = exc
+            self._stop_event.set()
+
     def poll(self):
-        self.tracker.mainloop()
+        if self._thread_error is not None:
+            raise RuntimeError(
+                "VRPN receive thread failed: %r" % self._thread_error
+            ) from self._thread_error
+
+        processed = 0
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event[0] == "pose":
+                _, p, q, stamp, received_monotonic = event
+                update_pose(
+                    self.state,
+                    self.previous_pose,
+                    p,
+                    q,
+                    stamp,
+                    received_monotonic=received_monotonic,
+                )
+            else:
+                _, v, stamp, received_monotonic = event
+                update_velocity(
+                    self.state,
+                    v,
+                    stamp,
+                    received_monotonic=received_monotonic,
+                )
+            processed += 1
+
+        return processed
 
     def description(self):
-        return f"VRPN {self.address}"
+        return f"VRPN {self.address} (threaded receiver)"
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
 
 
 # ----------------------------------------------------------------------
@@ -710,8 +777,9 @@ def main():
         return 0
 
     finally:
-        if isinstance(source, MockUdpSource):
-            source.close()
+        close_fn = getattr(source, "close", None)
+        if callable(close_fn):
+            close_fn()
 
 
 if __name__ == "__main__":

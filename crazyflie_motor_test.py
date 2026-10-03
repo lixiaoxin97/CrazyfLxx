@@ -21,7 +21,7 @@ from crazyflie_interface import CrazyflieInterface
 
 
 DEFAULT_URI = "radio://0/100/2M"
-DEFAULT_MASS_KG = 0.0429
+DEFAULT_MASS_KG = 0.0472
 
 
 def main():

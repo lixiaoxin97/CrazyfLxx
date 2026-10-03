@@ -29,8 +29,8 @@ Internal/control frame:
   +Z = up
 
 Current raw Vicon frame:
-  +X = right
-  +Y = forward
+  +X = forward
+  +Y = left
   +Z = up
 
 Example:
@@ -82,8 +82,8 @@ def quat_multiply(a, b):
 # Vicon frame -> control / FlightLxx frame
 #
 # Vicon:
-#   +X = right
-#   +Y = forward
+#   +X = forward
+#   +Y = left
 #   +Z = up
 #
 # Control / FlightLxx / Crazyflie:
@@ -91,58 +91,31 @@ def quat_multiply(a, b):
 #   +Y = left
 #   +Z = up
 #
-# Coordinate mapping:
-#   x =  y_vicon
-#   y = -x_vicon
-#   z =  z_vicon
-#
-# This is a proper rotation: Rz(-90 deg).
+# The Vicon axes are calibrated to the same FLU convention, so the boundary
+# transform is the identity.
 # ----------------------------------------------------------------------
 
-_SQRT_HALF = math.sqrt(0.5)
-
-Q_VICON_TO_CONTROL = (
-    0.0,
-    0.0,
-    -_SQRT_HALF,
-    _SQRT_HALF,
-)
+Q_VICON_TO_CONTROL = (0.0, 0.0, 0.0, 1.0)
 
 
 def vicon_vector_to_control(v):
-    """Transform a vector from the current Vicon frame to control frame."""
-    x, y, z = map(float, v)
-    return (
-        y,
-        -x,
-        z,
-    )
+    """Pass a vector from the calibrated Vicon FLU frame through unchanged."""
+    return tuple(float(value) for value in v)
 
 
 def vicon_quaternion_to_control(q):
     """
     Transform a Vicon rigid-body orientation to the control frame.
 
-    The current Vicon rigid-body local axes are treated consistently with the
-    current Vicon world axes (X=right, Y=forward, Z=up), while the control/body
-    axes are X=forward, Y=left, Z=up.
-
-    Re-expressing both world and body coordinates gives:
-
-        R_control = C * R_vicon * C^T
-
-    where C = Rz(-90 deg).
+    The current Vicon rigid-body/world axes are calibrated directly as
+    X=forward, Y=left, Z=up, matching the internal FLU convention. Only
+    normalization is needed here.
     """
     q = quat_normalize(q)
     if q is None:
         return None
 
-    qc = Q_VICON_TO_CONTROL
-    q_control = quat_multiply(
-        quat_multiply(qc, q),
-        quat_conjugate(qc),
-    )
-    return quat_normalize(q_control)
+    return q
 
 def quat_to_rpy_deg(q):
     """Quaternion [x,y,z,w] -> roll, pitch, yaw using ZYX convention."""

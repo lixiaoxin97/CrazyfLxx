@@ -40,29 +40,32 @@ running firmware built with:
     CONFIG_ENABLE_THRUST_BAT_COMPENSATED=y
     CONFIG_CRAZYFLIE_LEGACY_PROPELLERS=y
 
-For the legacy-propeller profile, current Bitcraze firmware defines:
+For the legacy-propeller profile, the flashed Bitcraze firmware defines:
 
     THRUST_MAX = 0.12 N per motor
     THRUST_MIN = 0.012817578393224994 N per motor
 
-and internally interprets the motor thrust command approximately as:
+The incoming 16-bit value is a *target thrust* command, not PWM. Firmware
+first interprets it as:
 
     motor_target_thrust_N = thrust_uint16 / 65535 * THRUST_MAX
 
-before battery-voltage compensation.
+and then uses the legacy-propeller cubic voltage-to-thrust curve plus the
+measured battery voltage to calculate PWM. The cubic curve must therefore not
+be applied a second time in this computer-side mapper.
 
 Vehicle mass for the current experiment:
-    42.9 g = 0.0429 kg
+    47.2 g = 0.0472 kg
 
 At 1 g:
-    total thrust ~= 0.420849 N
-    per motor    ~= 0.105212 N
-    uint16 thrust ~= 57459
+    total thrust ~= 0.463032 N
+    per motor    ~= 0.115758 N
+    uint16 thrust ~= 63218
 
 Because the vehicle is relatively heavy for legacy props, the theoretical
 maximum mass-normalized collective thrust using THRUST_MAX=0.12 N/motor is:
 
-    4 * 0.12 / 0.0429 ~= 11.1888 m/s^2
+    4 * 0.12 / 0.0472 ~= 10.1695 m/s^2
 
 Any higher FlightLxx collective-thrust request must saturate on this hardware.
 
@@ -87,11 +90,20 @@ import time
 
 UINT16_MAX = 65535
 
-DEFAULT_MASS_KG = 0.0429
+DEFAULT_MASS_KG = 0.0472
 
 # Current Bitcraze legacy-propeller profile.
 LEGACY_THRUST_MAX_PER_MOTOR_N = 0.12
 LEGACY_THRUST_MIN_PER_MOTOR_N = 0.012817578393224994
+
+# Exact CONFIG_CRAZYFLIE_LEGACY_PROPELLERS curve in the flashed firmware.
+# These coefficients describe static motor thrust as a function of the
+# battery-compensated motor voltage Vm [V]:
+#   Fm [N] = c0 + c1*Vm + c2*Vm^2 + c3*Vm^3
+LEGACY_VMOTOR2THRUST0 = -0.014830744918356092
+LEGACY_VMOTOR2THRUST1 = 0.04724465241828281
+LEGACY_VMOTOR2THRUST2 = -0.01847364358025878
+LEGACY_VMOTOR2THRUST3 = 0.005960923942142
 
 # FlightLxx policy physical body-rate ranges.
 DEFAULT_MAX_ROLL_RATE_DEG_S = 360.0
@@ -101,6 +113,36 @@ DEFAULT_MAX_YAW_RATE_DEG_S = 180.0
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def legacy_target_thrust_from_uint16(
+    thrust_uint16,
+    thrust_max_per_motor_n=LEGACY_THRUST_MAX_PER_MOTOR_N,
+    thrust_min_per_motor_n=LEGACY_THRUST_MIN_PER_MOTOR_N,
+):
+    """
+    Decode the target thrust represented by a Crazyflie legacy command.
+
+    This mirrors the first stage of motorsCompensateBatteryVoltage() in the
+    flashed firmware. It intentionally does not estimate PWM because that
+    additionally requires the live battery voltage.
+    """
+    command = int(clamp(int(round(float(thrust_uint16))), 0, UINT16_MAX))
+    target = command / float(UINT16_MAX) * float(thrust_max_per_motor_n)
+    return 0.0 if target < float(thrust_min_per_motor_n) else target
+
+
+def legacy_propeller_thrust_from_voltage(motor_voltage_v):
+    """Evaluate the flashed legacy-propeller static thrust curve [N]."""
+    vm = float(motor_voltage_v)
+    if not math.isfinite(vm):
+        raise ValueError("motor_voltage_v must be finite")
+    return (
+        LEGACY_VMOTOR2THRUST0
+        + LEGACY_VMOTOR2THRUST1 * vm
+        + LEGACY_VMOTOR2THRUST2 * vm * vm
+        + LEGACY_VMOTOR2THRUST3 * vm * vm * vm
+    )
 
 
 def collective_thrust_to_uint16(
@@ -118,6 +160,10 @@ def collective_thrust_to_uint16(
         F_motor = F_total / 4
 
         u = 65535 * F_motor / THRUST_MAX
+
+    Here F_motor is the firmware's target thrust. The flashed firmware then
+    performs the nonlinear legacy-propeller voltage/PWM compensation. Do not
+    replace this linear target-command conversion with the cubic curve.
 
     The output is clipped to [0, 65535].
 
@@ -162,20 +208,23 @@ def collective_thrust_to_uint16(
     command_uint16 = int(round(command_float))
     command_uint16 = int(clamp(command_uint16, 0, UINT16_MAX))
 
+    # Decode the command using the same target-thrust semantics as firmware.
+    # This makes the host-side result explicit without trying to reproduce the
+    # battery-voltage-dependent PWM inversion on the computer.
+    per_motor_realizable_n = legacy_target_thrust_from_uint16(
+        command_uint16,
+        thrust_max_per_motor_n=thrust_max_per_motor_n,
+        thrust_min_per_motor_n=thrust_min_per_motor_n,
+    )
     below_min = (
         command_uint16 > 0
-        and per_motor_used_n < thrust_min_per_motor_n
+        and per_motor_realizable_n == 0.0
     )
 
     # Match firmware behavior: thrust below THRUST_MIN becomes zero.
     if below_min:
         command_uint16 = 0
         per_motor_realizable_n = 0.0
-    else:
-        per_motor_realizable_n = (
-            command_uint16 / float(UINT16_MAX)
-            * thrust_max_per_motor_n
-        )
 
     total_thrust_realizable_n = 4.0 * per_motor_realizable_n
     collective_thrust_realizable_m_s2 = (
@@ -215,11 +264,15 @@ def prepare_rate_command(
     max_yaw_rate_deg_s=DEFAULT_MAX_YAW_RATE_DEG_S,
 ):
     """
-    Prepare desired Crazyflie body-rate commands.
+    Prepare desired body-rate commands in the FlightLxx/Crazyflie FLU frame.
 
-    The input/output of this helper use the intuitive Crazyflie body-rate signs.
-    Historical cflib/firmware sign compensation is handled separately when the
-    packet is sent.
+    Physical positive directions use the right-handed body frame:
+        +roll  : right side down
+        +pitch : nose down
+        +yaw   : nose turns left
+
+    Conversion to the public cflib send_setpoint() convention is handled
+    separately when the packet is sent.
 
     Returns:
         dict with clipped body rates in deg/s.
@@ -256,26 +309,27 @@ def body_rates_to_legacy_send_setpoint_args(
     yaw_rate_deg_s,
 ):
     """
-    Convert desired firmware body rates to cflib send_setpoint() arguments.
+    Convert FLU body rates to public cflib send_setpoint() arguments.
 
-    Current cflib send_setpoint() packs:
-        roll, -pitch, yawrate
+    FlightLxx/CrazyfLxx physical convention (right-handed FLU):
+        +roll  = right side down
+        +pitch = nose down
+        +yaw   = nose turns left
 
-    The legacy RPYT firmware RATE decoder then uses:
-        roll_rate  = packet.roll
-        pitch_rate = packet.pitch
-        yaw_rate   = -packet.yaw
+    Public cflib send_setpoint() convention:
+        +roll  = right side down
+        +pitch = nose up
+        +yaw   = nose turns left
 
-    Therefore to realize desired:
-        [roll_rate, pitch_rate, yaw_rate]
-
-    call cflib with:
-        [roll_rate, -pitch_rate, -yaw_rate]
+    Only pitch changes sign at this physical API boundary.  cflib's packet
+    pitch negation and the legacy firmware's internal yaw negation are already
+    part of implementing the public API convention and must not be compensated
+    a second time here.
     """
     return (
         float(roll_rate_deg_s),
         -float(pitch_rate_deg_s),
-        -float(yaw_rate_deg_s),
+        float(yaw_rate_deg_s),
     )
 
 
@@ -293,7 +347,10 @@ class CrazyflieInterface(object):
         dry_run=True,
         cache_dir="./cache",
         roll_sign=1.0,
-        pitch_sign=-1.0,
+        # Keep upstream FlightLxx FLU rates unchanged here. Conversion to the
+        # public cflib pitch convention is centralized in
+        # body_rates_to_legacy_send_setpoint_args().
+        pitch_sign=1.0,
         yaw_sign=1.0,
     ):
         self.uri = (
@@ -597,8 +654,8 @@ def main():
     parser.add_argument(
         "--mass-g",
         type=float,
-        default=42.9,
-        help="all-up vehicle mass [g]; default 42.9",
+        default=47.2,
+        help="all-up vehicle mass [g]; default 47.2",
     )
 
     parser.add_argument(
