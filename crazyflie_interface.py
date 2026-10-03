@@ -320,16 +320,21 @@ def body_rates_to_legacy_send_setpoint_args(
         +roll  = right side down
         +pitch = nose up
         +yaw   = nose turns left
+    Deployment mapping used for the current flight test:
+        roll  : pass through
+        pitch : pass through
+        yaw   : invert at the public cflib commander boundary
 
-    Only pitch changes sign at this physical API boundary.  cflib's packet
-    pitch negation and the legacy firmware's internal yaw negation are already
-    part of implementing the public API convention and must not be compensated
-    a second time here.
+    The pitch inversion was removed after flight/Vicon data showed an opposite
+    physical pitch response.  The yaw inversion is applied here for the next
+    controlled validation; keep all sign adaptation centralized in this
+    hardware API adapter.
+
     """
     return (
         float(roll_rate_deg_s),
-        -float(pitch_rate_deg_s),
-        float(yaw_rate_deg_s),
+        float(pitch_rate_deg_s),
+        -float(yaw_rate_deg_s),
     )
 
 
