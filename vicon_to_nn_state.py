@@ -54,6 +54,17 @@ import numpy as np
 MAX_POSE_ANGULAR_RATE_RAD_S = 20.0
 MAX_POSE_LINEAR_RATE_M_S = 8.0
 
+# Normal continuity checks based on rate are only meaningful while Vicon
+# samples are arriving continuously.  After a longer gap, dividing a large
+# pose jump by the whole gap can make a tracking swap look physically valid.
+MAX_POSE_CONTINUITY_DT_S = 0.2
+
+# Reacquisition guard relative to the last accepted pose.  These limits are
+# intentionally generous for the current hover/takeoff experiments, but reject
+# the kind of single-frame rigid-body swap seen in experiment 5.
+MAX_REACQUIRE_POSITION_JUMP_M = 0.40
+MAX_REACQUIRE_ATTITUDE_JUMP_RAD = math.radians(60.0)
+
 
 # ----------------------------------------------------------------------
 # Quaternion helpers -- convention: [x, y, z, w]
@@ -69,6 +80,19 @@ def quat_normalize(q):
 
 def quat_dot(a, b):
     return sum(float(x) * float(y) for x, y in zip(a, b))
+
+
+def quat_angular_distance_rad(a, b):
+    """Shortest rotation angle between two orientations [rad]."""
+    qa = quat_normalize(a)
+    qb = quat_normalize(b)
+    if qa is None or qb is None:
+        return None
+
+    # q and -q represent the same attitude.
+    dot = abs(quat_dot(qa, qb))
+    dot = max(-1.0, min(1.0, dot))
+    return 2.0 * math.acos(dot)
 
 
 def quat_conjugate(q):
@@ -264,7 +288,21 @@ def update_pose(
     ):
         dt = timestamp_dt_seconds(timestamp, previous_pose["timestamp"])
 
-        if dt is not None and 1e-5 < dt < 0.2:
+        if dt is None or dt <= 1e-5:
+            state["pose_outlier"] = True
+            return False
+
+        previous_position = previous_pose.get("position")
+        displacement = None
+        if previous_position is not None:
+            displacement = math.sqrt(
+                sum(
+                    (p[index] - previous_position[index]) ** 2
+                    for index in range(3)
+                )
+            )
+
+        if dt < MAX_POSE_CONTINUITY_DT_S:
             omega = body_angular_velocity(
                 previous_pose["quaternion"],
                 q,
@@ -279,17 +317,39 @@ def update_pose(
                 state["pose_outlier"] = True
                 return False
 
-            previous_position = previous_pose.get("position")
-            if previous_position is not None:
-                displacement = math.sqrt(
-                    sum(
-                        (p[index] - previous_position[index]) ** 2
-                        for index in range(3)
-                    )
-                )
-                if displacement / dt > MAX_POSE_LINEAR_RATE_M_S:
-                    state["pose_outlier"] = True
-                    return False
+            if (
+                displacement is not None
+                and displacement / dt > MAX_POSE_LINEAR_RATE_M_S
+            ):
+                state["pose_outlier"] = True
+                return False
+
+        else:
+            # Vicon has resumed after a gap. Do not dilute a potentially huge
+            # tracking jump by dividing it by the long missing-data interval.
+            # Instead compare the new sample directly with the last accepted
+            # pose. If it is plausible, accept it as a fresh baseline but do
+            # not synthesize angular velocity across the gap.
+            attitude_jump = quat_angular_distance_rad(
+                previous_pose["quaternion"],
+                q,
+            )
+            if attitude_jump is None:
+                state["pose_outlier"] = True
+                return False
+
+            if attitude_jump > MAX_REACQUIRE_ATTITUDE_JUMP_RAD:
+                state["pose_outlier"] = True
+                return False
+
+            if (
+                displacement is not None
+                and displacement > MAX_REACQUIRE_POSITION_JUMP_M
+            ):
+                state["pose_outlier"] = True
+                return False
+
+            omega = None
 
     state["pose_outlier"] = False
 

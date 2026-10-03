@@ -69,6 +69,11 @@ import time
 
 import numpy as np
 
+try:
+    from cflib.crazyflie.log import LogConfig
+except ImportError:
+    LogConfig = None
+
 from action_converter import convert_action
 from crazyflie_interface import CrazyflieInterface
 from experiment_data_logger import ExperimentDataLogger
@@ -308,6 +313,25 @@ class CrazyflieFlightLink(object):
     def __init__(self, hardware):
         self.hardware = hardware
 
+        # Latest onboard estimator/stabilizer diagnostics.  These values are
+        # observation-only and never feed back into flight control.
+        self.onboard_state = {
+            "stateEstimate.x": None,
+            "stateEstimate.y": None,
+            "stateEstimate.z": None,
+            "stateEstimate.vx": None,
+            "stateEstimate.vy": None,
+            "stateEstimate.vz": None,
+            "stabilizer.roll": None,
+            "stabilizer.pitch": None,
+            "stabilizer.yaw": None,
+            "position_velocity_rx_monotonic": None,
+            "attitude_rx_monotonic": None,
+            "position_velocity_cf_timestamp_ms": None,
+            "attitude_cf_timestamp_ms": None,
+        }
+        self._diagnostic_log_configs = []
+
     @property
     def dry_run(self):
         return self.hardware.dry_run
@@ -343,6 +367,131 @@ class CrazyflieFlightLink(object):
                     "Parameter verification failed: %s=%r, expected %r"
                     % (name, actual, value)
                 )
+
+    def _onboard_position_velocity_cb(self, timestamp, data, logconf):
+        for name in (
+            "stateEstimate.x",
+            "stateEstimate.y",
+            "stateEstimate.z",
+            "stateEstimate.vx",
+            "stateEstimate.vy",
+            "stateEstimate.vz",
+        ):
+            if name in data:
+                self.onboard_state[name] = float(data[name])
+
+        self.onboard_state["position_velocity_cf_timestamp_ms"] = int(timestamp)
+        self.onboard_state["position_velocity_rx_monotonic"] = time.monotonic()
+
+    def _onboard_attitude_cb(self, timestamp, data, logconf):
+        for name in (
+            "stabilizer.roll",
+            "stabilizer.pitch",
+            "stabilizer.yaw",
+        ):
+            if name in data:
+                self.onboard_state[name] = float(data[name])
+
+        self.onboard_state["attitude_cf_timestamp_ms"] = int(timestamp)
+        self.onboard_state["attitude_rx_monotonic"] = time.monotonic()
+
+    @staticmethod
+    def _onboard_log_error_cb(logconf, message):
+        print(
+            "WARNING: onboard diagnostic log %s: %s"
+            % (getattr(logconf, "name", "?"), message),
+            file=sys.stderr,
+        )
+
+    def start_onboard_diagnostic_logging(self, period_ms=20):
+        """Log onboard EKF/stabilizer state without affecting control."""
+        if self.dry_run:
+            print("[DRY RUN] onboard diagnostic logging enabled")
+            return
+
+        if LogConfig is None:
+            raise RuntimeError(
+                "cflib LogConfig is unavailable; cannot start onboard diagnostics"
+            )
+
+        if self._diagnostic_log_configs:
+            return
+
+        # A CRTP log block has a strict payload limit.  Keep the six estimator
+        # floats (24 bytes) separate from the three attitude floats (12 bytes).
+        posvel = LogConfig(
+            name="cf_diag_posvel",
+            period_in_ms=int(period_ms),
+        )
+        for name in (
+            "stateEstimate.x",
+            "stateEstimate.y",
+            "stateEstimate.z",
+            "stateEstimate.vx",
+            "stateEstimate.vy",
+            "stateEstimate.vz",
+        ):
+            posvel.add_variable(name, "float")
+
+        attitude = LogConfig(
+            name="cf_diag_att",
+            period_in_ms=int(period_ms),
+        )
+        for name in (
+            "stabilizer.roll",
+            "stabilizer.pitch",
+            "stabilizer.yaw",
+        ):
+            attitude.add_variable(name, "float")
+
+        configs = (
+            (posvel, self._onboard_position_velocity_cb),
+            (attitude, self._onboard_attitude_cb),
+        )
+
+        started = []
+        try:
+            for config, callback in configs:
+                self.cf.log.add_config(config)
+                if not config.valid:
+                    raise RuntimeError(
+                        "Crazyflie rejected diagnostic log config %s; "
+                        "check firmware log TOC" % config.name
+                    )
+                config.data_received_cb.add_callback(callback)
+                config.error_cb.add_callback(self._onboard_log_error_cb)
+                config.start()
+                started.append(config)
+
+            self._diagnostic_log_configs = started
+            print(
+                "Onboard diagnostics: stateEstimate xyz/vxyz + "
+                "stabilizer roll/pitch/yaw @ %d ms"
+                % int(period_ms)
+            )
+        except Exception:
+            for config in started:
+                try:
+                    config.stop()
+                except Exception:
+                    pass
+                try:
+                    config.delete()
+                except Exception:
+                    pass
+            raise
+
+    def stop_onboard_diagnostic_logging(self):
+        for config in list(self._diagnostic_log_configs):
+            try:
+                config.stop()
+            except Exception:
+                pass
+            try:
+                config.delete()
+            except Exception:
+                pass
+        self._diagnostic_log_configs = []
 
     def configure_position_stack(self):
         """
@@ -1243,7 +1392,31 @@ class CrazyfLxxController(object):
             )
             return
 
-        # NN specifically requires fresh pose + velocity + angular rate.
+        # Position-controlled flight depends on continuously injected external
+        # position. Experiment 5 showed that waiting all the way to the hard
+        # timeout can leave the estimator/controller operating through a Vicon
+        # dropout and a bad reacquisition. Stop and disarm at the soft timeout
+        # instead of continuing to fly on stale external position.
+        if self.mode in (
+            STATE_TAKEOFF,
+            STATE_POSITION_HOLD,
+            STATE_RETURN_POSITION,
+            STATE_LANDING,
+        ):
+            if pose_age_ms > self.args.vicon_soft_timeout_ms:
+                self.normal_stop_and_disarm(
+                    "Vicon pose age %.1f ms > airborne soft limit %.1f ms"
+                    % (
+                        pose_age_ms,
+                        self.args.vicon_soft_timeout_ms,
+                    )
+                )
+                return
+
+        # NN requires fresh pose + velocity + angular rate.  Its normal first
+        # response remains a hand-back to position control.  The next watchdog
+        # iteration will stop/disarm as well if external position itself is
+        # still stale.
         if self.mode == STATE_NN:
             if (
                 pose_age_ms > self.args.vicon_soft_timeout_ms
@@ -2077,6 +2250,7 @@ def main():
 
     try:
         hardware.connect()
+        link.start_onboard_diagnostic_logging(period_ms=20)
 
         controller.wait_for_initial_vicon()
         controller.initialize_estimator()
@@ -2091,6 +2265,15 @@ def main():
         controller.run()
 
     finally:
+        # Stop observation-only log blocks before closing the radio link.
+        try:
+            link.stop_onboard_diagnostic_logging()
+        except Exception as exc:
+            print(
+                "WARNING: failed to stop onboard diagnostics: %s" % exc,
+                file=sys.stderr,
+            )
+
         # Never leave the radio commander active when the program exits.
         try:
             if hardware.connected:

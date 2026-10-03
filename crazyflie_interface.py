@@ -93,7 +93,10 @@ UINT16_MAX = 65535
 DEFAULT_MASS_KG = 0.0472
 
 # Current Bitcraze legacy-propeller profile.
-LEGACY_THRUST_MAX_PER_MOTOR_N = 0.12
+# Effective per-motor thrust-command calibration for the current Crazyflie.
+# Fifth-flight deployment calibration: 0.125 N/motor effective command scale.
+# This is an empirical host-side calibration, not a claim about exact physical max thrust.
+LEGACY_THRUST_MAX_PER_MOTOR_N = 0.125
 LEGACY_THRUST_MIN_PER_MOTOR_N = 0.012817578393224994
 
 # Exact CONFIG_CRAZYFLIE_LEGACY_PROPELLERS curve in the flashed firmware.
@@ -195,6 +198,13 @@ def collective_thrust_to_uint16(
     a_max_m_s2 = 4.0 * thrust_max_per_motor_n / mass_kg
     a_min_nonzero_m_s2 = 4.0 * thrust_min_per_motor_n / mass_kg
 
+    # Preserve the pre-saturation command for diagnostics. This is the
+    # uint16 value the calibrated linear mapping would request if the legacy
+    # command were not limited to [0, 65535].
+    command_unclipped = (
+        UINT16_MAX * per_motor_requested_n / thrust_max_per_motor_n
+    )
+
     per_motor_used_n = clamp(
         per_motor_requested_n,
         0.0,
@@ -244,6 +254,7 @@ def collective_thrust_to_uint16(
         "used_total_thrust_N": total_thrust_realizable_n,
         "requested_per_motor_thrust_N": per_motor_requested_n,
         "used_per_motor_thrust_N": per_motor_realizable_n,
+        "thrust_uint16_unclipped": command_unclipped,
         "thrust_uint16": command_uint16,
         "max_collective_thrust_m_s2": a_max_m_s2,
         "min_nonzero_collective_thrust_m_s2": a_min_nonzero_m_s2,
@@ -545,6 +556,9 @@ class CrazyflieInterface(object):
             ),
             "requested_collective_thrust_m_s2": (
                 thrust["requested_collective_thrust_m_s2"]
+            ),
+            "thrust_uint16_unclipped": (
+                thrust["thrust_uint16_unclipped"]
             ),
             "thrust_uint16": thrust["thrust_uint16"],
             "thrust_saturated": thrust["saturated"],

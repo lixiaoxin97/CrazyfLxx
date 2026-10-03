@@ -74,6 +74,22 @@ class ExperimentDataLogger(object):
         "wx_rad_s",
         "wy_rad_s",
         "wz_rad_s",
+
+        # Crazyflie onboard estimator/stabilizer diagnostics.  These are raw
+        # firmware log values; no sign/convention conversion is applied here.
+        "cf_x_m",
+        "cf_y_m",
+        "cf_z_m",
+        "cf_vx_m_s",
+        "cf_vy_m_s",
+        "cf_vz_m_s",
+        "cf_roll_deg",
+        "cf_pitch_deg",
+        "cf_yaw_deg",
+        "cf_posvel_age_ms",
+        "cf_attitude_age_ms",
+        "cf_posvel_timestamp_ms",
+        "cf_attitude_timestamp_ms",
     ]
 
     FIELDNAMES += ["obs_%d" % i for i in range(12)]
@@ -84,6 +100,7 @@ class ExperimentDataLogger(object):
         "yaw_rate_deg_s",
         "requested_thrust_m_s2",
         "used_thrust_m_s2",
+        "thrust_uint16_unclipped",
         "thrust_uint16",
         "rate_saturated",
         "thrust_saturated",
@@ -185,6 +202,43 @@ class ExperimentDataLogger(object):
 
         return row
 
+    @staticmethod
+    def _onboard_row(controller, now):
+        row = {}
+        link = getattr(controller, "link", None)
+        state = getattr(link, "onboard_state", None)
+        if not isinstance(state, dict):
+            return row
+
+        mapping = {
+            "stateEstimate.x": "cf_x_m",
+            "stateEstimate.y": "cf_y_m",
+            "stateEstimate.z": "cf_z_m",
+            "stateEstimate.vx": "cf_vx_m_s",
+            "stateEstimate.vy": "cf_vy_m_s",
+            "stateEstimate.vz": "cf_vz_m_s",
+            "stabilizer.roll": "cf_roll_deg",
+            "stabilizer.pitch": "cf_pitch_deg",
+            "stabilizer.yaw": "cf_yaw_deg",
+            "position_velocity_cf_timestamp_ms": "cf_posvel_timestamp_ms",
+            "attitude_cf_timestamp_ms": "cf_attitude_timestamp_ms",
+        }
+        for source_key, target_key in mapping.items():
+            row[target_key] = _finite_or_blank(state.get(source_key))
+
+        posvel_rx = state.get("position_velocity_rx_monotonic")
+        attitude_rx = state.get("attitude_rx_monotonic")
+        if posvel_rx is not None:
+            row["cf_posvel_age_ms"] = _finite_or_blank(
+                1000.0 * (now - float(posvel_rx))
+            )
+        if attitude_rx is not None:
+            row["cf_attitude_age_ms"] = _finite_or_blank(
+                1000.0 * (now - float(attitude_rx))
+            )
+
+        return row
+
     def write_controller_sample(self, controller, now):
         """Record one sample from a running CrazyfLxxController."""
         row = self._state_row(
@@ -193,6 +247,7 @@ class ExperimentDataLogger(object):
             controller.hover,
             controller.nn_goal,
         )
+        row.update(self._onboard_row(controller, now))
         row.update({
             "timestamp_utc": datetime.utcnow().isoformat(timespec="microseconds")
             + "Z",
@@ -216,6 +271,7 @@ class ExperimentDataLogger(object):
                 "yaw_rate_deg_s": "yaw_rate_deg_s",
                 "requested_collective_thrust_m_s2": "requested_thrust_m_s2",
                 "collective_thrust_m_s2": "used_thrust_m_s2",
+                "thrust_uint16_unclipped": "thrust_uint16_unclipped",
                 "thrust_uint16": "thrust_uint16",
                 "rate_saturated": "rate_saturated",
                 "thrust_saturated": "thrust_saturated",
