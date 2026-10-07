@@ -75,7 +75,11 @@ except ImportError:
     LogConfig = None
 
 from action_converter import convert_action
-from crazyflie_interface import CrazyflieInterface
+from crazyflie_interface import (
+    DEFAULT_MASS_KG,
+    DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N,
+    CrazyflieInterface,
+)
 from experiment_data_logger import ExperimentDataLogger
 from vicon_to_nn_state import (
     MockUdpSource,
@@ -1283,9 +1287,9 @@ class CrazyfLxxController(object):
         self.last_nn_raw_action = raw_action.copy()
         self.last_nn_info = info
 
-        # Persistent physical thrust saturation is a sign that the learned
-        # controller is asking more than this 47.2 g legacy-prop vehicle
-        # can produce. Fall back to position control rather than stay pinned.
+        # Persistent mapped-command saturation means the policy requests
+        # values outside the calibrated uint16 command range. Hand control
+        # back to position control rather than staying pinned at the limit.
         if info["thrust_saturated"]:
             if self.nn_saturation_start is None:
                 self.nn_saturation_start = now
@@ -1875,7 +1879,13 @@ def build_arg_parser():
     parser.add_argument(
         "--mass-g",
         type=float,
-        default=47.2,
+        default=DEFAULT_MASS_KG * 1000.0,
+    )
+    parser.add_argument(
+        "--thrust-scale-per-motor-n",
+        type=float,
+        default=DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N,
+        help="empirical host thrust/command scale [N/motor]; default %(default)s",
     )
     parser.add_argument(
         "--live",
@@ -2096,6 +2106,7 @@ def build_arg_parser():
 def validate_args(parser, args):
     positive = (
         "mass_g",
+        "thrust_scale_per_motor_n",
         "control_rate",
         "vicon_send_rate",
         "takeoff_duration",
@@ -2113,8 +2124,8 @@ def validate_args(parser, args):
     )
 
     for name in positive:
-        if getattr(args, name) <= 0.0:
-            parser.error("--%s must be > 0" % name.replace("_", "-"))
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0.0:
+            parser.error("--%s must be finite and > 0" % name.replace("_", "-"))
 
     if args.idle_thrust < 0.0:
         parser.error("--idle-thrust must be >= 0")
@@ -2168,6 +2179,7 @@ def main():
     )
     print("Crazyflie URI : %s" % args.uri)
     print("mass          : %.4f kg" % args.mass_kg)
+    print("thrust scale  : %.6f N/motor" % args.thrust_scale_per_motor_n)
     print(
         "hover target  : [%.2f, %.2f, %.2f] m"
         % tuple(args.hover)
@@ -2231,6 +2243,7 @@ def main():
         roll_sign=1.0,
         pitch_sign=1.0,
         yaw_sign=1.0,
+        thrust_scale_per_motor_n=args.thrust_scale_per_motor_n,
     )
 
     link = CrazyflieFlightLink(hardware)

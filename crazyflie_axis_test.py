@@ -31,11 +31,10 @@ Only one body-rate axis is non-zero at a time.
 import argparse
 import time
 
-from crazyflie_interface import CrazyflieInterface
+from crazyflie_interface import DEFAULT_MASS_KG, CrazyflieInterface
 
 
 DEFAULT_URI = "radio://0/100/2M"
-DEFAULT_MASS_KG = 0.0472
 
 
 def make_rates(axis, rate_deg_s):

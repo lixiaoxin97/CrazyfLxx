@@ -55,19 +55,22 @@ measured battery voltage to calculate PWM. The cubic curve must therefore not
 be applied a second time in this computer-side mapper.
 
 Vehicle mass for the current experiment:
-    47.2 g = 0.0472 kg
+    46.5 g = 0.0465 kg
 
-At 1 g:
-    total thrust ~= 0.463032 N
-    per motor    ~= 0.115758 N
-    uint16 thrust ~= 63218
+Host calibration is separate from the flashed firmware constants:
+    command scale = 0.133 N/motor
+    u = 65535 * mass_kg * collective_thrust_m_s2 / (4 * command_scale)
 
-Because the vehicle is relatively heavy for legacy props, the theoretical
-maximum mass-normalized collective thrust using THRUST_MAX=0.12 N/motor is:
+The supplied CTBR+ID logs hover above the target. Near-steady samples imply
+an effective scale around 0.133 N/motor if they describe this 46.5 g vehicle.
+This is an initial flight-log estimate, not a measured physical maximum.
+Increasing the scale reduces the command for the same requested thrust.
+At the defaults, a 9.81 m/s^2 request maps to approximately 56193.
 
-    4 * 0.12 / 0.0472 ~= 10.1695 m/s^2
-
-Any higher FlightLxx collective-thrust request must saturate on this hardware.
+Firmware still decodes that command with its own THRUST_MAX=0.12 N/motor.
+Its THRUST_MIN cutoff is applied in firmware units, independently of the
+host calibration. Logged "used" thrust is a calibrated estimate, not a
+measurement of actual thrust or available battery-dependent headroom.
 
 SAFETY
 ------
@@ -90,14 +93,16 @@ import time
 
 UINT16_MAX = 65535
 
-DEFAULT_MASS_KG = 0.0472
+DEFAULT_MASS_KG = 0.0465
 
-# Current Bitcraze legacy-propeller profile.
-# Effective per-motor thrust-command calibration for the current Crazyflie.
-# Fifth-flight deployment calibration: 0.125 N/motor effective command scale.
-# This is an empirical host-side calibration, not a claim about exact physical max thrust.
-LEGACY_THRUST_MAX_PER_MOTOR_N = 0.125
+# Flashed firmware constants; do not change these to tune host calibration.
+LEGACY_THRUST_MAX_PER_MOTOR_N = 0.12
 LEGACY_THRUST_MIN_PER_MOTOR_N = 0.012817578393224994
+
+# Effective physical-thrust/command scale estimated from the supplied n3
+# near-steady hover logs, using the updated 46.5 g mass. Previously 0.125.
+# A larger scale sends a smaller uint16 command. This is not THRUST_MAX.
+DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N = 0.131
 
 # Exact CONFIG_CRAZYFLIE_LEGACY_PROPELLERS curve in the flashed firmware.
 # These coefficients describe static motor thrust as a function of the
@@ -151,7 +156,7 @@ def legacy_propeller_thrust_from_voltage(motor_voltage_v):
 def collective_thrust_to_uint16(
     collective_thrust_m_s2,
     mass_kg=DEFAULT_MASS_KG,
-    thrust_max_per_motor_n=LEGACY_THRUST_MAX_PER_MOTOR_N,
+    thrust_max_per_motor_n=DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N,
     thrust_min_per_motor_n=LEGACY_THRUST_MIN_PER_MOTOR_N,
 ):
     """
@@ -162,18 +167,20 @@ def collective_thrust_to_uint16(
         F_total = m * a_T
         F_motor = F_total / 4
 
-        u = 65535 * F_motor / THRUST_MAX
+        u = 65535 * F_motor / command_scale
 
-    Here F_motor is the firmware's target thrust. The flashed firmware then
-    performs the nonlinear legacy-propeller voltage/PWM compensation. Do not
-    replace this linear target-command conversion with the cubic curve.
+    The existing argument name ``thrust_max_per_motor_n`` is retained for
+    compatibility; here it means the empirical HOST command scale, not the
+    flashed firmware's THRUST_MAX. The firmware performs voltage/PWM
+    compensation, so the cubic curve is not applied on the host.
 
     The output is clipped to [0, 65535].
 
     For battery-compensated firmware, commands below the firmware's
     THRUST_MIN threshold are effectively zero. We mirror that behavior here.
 
-    Returns a dictionary with both the requested and realizable quantities.
+    Returns requested and calibrated estimated quantities. Actual thrust
+    requires measurement; battery/PWM and mixer limits are not modeled here.
     """
     a_requested = float(collective_thrust_m_s2)
     mass_kg = float(mass_kg)
@@ -184,19 +191,29 @@ def collective_thrust_to_uint16(
         raise ValueError("collective_thrust_m_s2 must be finite")
     if mass_kg <= 0.0 or not math.isfinite(mass_kg):
         raise ValueError("mass_kg must be finite and > 0")
-    if thrust_max_per_motor_n <= 0.0:
-        raise ValueError("thrust_max_per_motor_n must be > 0")
-    if thrust_min_per_motor_n < 0.0:
-        raise ValueError("thrust_min_per_motor_n must be >= 0")
+    if not math.isfinite(thrust_max_per_motor_n) or thrust_max_per_motor_n <= 0.0:
+        raise ValueError("thrust_max_per_motor_n must be finite and > 0")
+    if (
+        not math.isfinite(thrust_min_per_motor_n)
+        or not 0.0 <= thrust_min_per_motor_n <= LEGACY_THRUST_MAX_PER_MOTOR_N
+    ):
+        raise ValueError("firmware thrust minimum must be finite and within [0, THRUST_MAX]")
 
     # Negative collective thrust is not physically available on the brushed CF.
     a_nonnegative = max(0.0, a_requested)
 
     total_thrust_requested_n = mass_kg * a_nonnegative
+    if not math.isfinite(total_thrust_requested_n):
+        raise ValueError("requested total thrust must be finite")
     per_motor_requested_n = total_thrust_requested_n / 4.0
 
     a_max_m_s2 = 4.0 * thrust_max_per_motor_n / mass_kg
-    a_min_nonzero_m_s2 = 4.0 * thrust_min_per_motor_n / mass_kg
+    minimum_command = int(math.ceil(
+        UINT16_MAX * thrust_min_per_motor_n / LEGACY_THRUST_MAX_PER_MOTOR_N
+    ))
+    a_min_nonzero_m_s2 = (
+        4.0 * thrust_max_per_motor_n * minimum_command / UINT16_MAX / mass_kg
+    )
 
     # Preserve the pre-saturation command for diagnostics. This is the
     # uint16 value the calibrated linear mapping would request if the legacy
@@ -218,24 +235,27 @@ def collective_thrust_to_uint16(
     command_uint16 = int(round(command_float))
     command_uint16 = int(clamp(command_uint16, 0, UINT16_MAX))
 
-    # Decode the command using the same target-thrust semantics as firmware.
-    # This makes the host-side result explicit without trying to reproduce the
-    # battery-voltage-dependent PWM inversion on the computer.
-    per_motor_realizable_n = legacy_target_thrust_from_uint16(
+    # Apply the dead zone in firmware units, not in calibrated host units.
+    firmware_target_n = legacy_target_thrust_from_uint16(
         command_uint16,
-        thrust_max_per_motor_n=thrust_max_per_motor_n,
+        thrust_max_per_motor_n=LEGACY_THRUST_MAX_PER_MOTOR_N,
         thrust_min_per_motor_n=thrust_min_per_motor_n,
     )
     below_min = (
         command_uint16 > 0
-        and per_motor_realizable_n == 0.0
+        and firmware_target_n == 0.0
     )
 
     # Match firmware behavior: thrust below THRUST_MIN becomes zero.
     if below_min:
         command_uint16 = 0
-        per_motor_realizable_n = 0.0
+        firmware_target_n = 0.0
 
+    # Decode estimated physical thrust with the same HOST calibration used
+    # for encoding. This preserves the existing logger's units.
+    per_motor_realizable_n = (
+        command_uint16 / float(UINT16_MAX) * thrust_max_per_motor_n
+    )
     total_thrust_realizable_n = 4.0 * per_motor_realizable_n
     collective_thrust_realizable_m_s2 = (
         total_thrust_realizable_n / mass_kg
@@ -260,6 +280,8 @@ def collective_thrust_to_uint16(
         "min_nonzero_collective_thrust_m_s2": a_min_nonzero_m_s2,
         "saturated": saturated,
         "below_min": below_min,
+        "firmware_target_per_motor_thrust_N": firmware_target_n,
+        "command_scale_per_motor_N": thrust_max_per_motor_n,
     }
 
 
@@ -368,6 +390,7 @@ class CrazyflieInterface(object):
         # body_rates_to_legacy_send_setpoint_args().
         pitch_sign=1.0,
         yaw_sign=1.0,
+        thrust_scale_per_motor_n=DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N,
     ):
         self.uri = (
             uri
@@ -376,6 +399,14 @@ class CrazyflieInterface(object):
         )
 
         self.mass_kg = float(mass_kg)
+        self.thrust_scale_per_motor_n = float(thrust_scale_per_motor_n)
+        if not math.isfinite(self.mass_kg) or self.mass_kg <= 0.0:
+            raise ValueError("mass_kg must be finite and > 0")
+        if (
+            not math.isfinite(self.thrust_scale_per_motor_n)
+            or self.thrust_scale_per_motor_n <= 0.0
+        ):
+            raise ValueError("thrust_scale_per_motor_n must be finite and > 0")
         self.dry_run = bool(dry_run)
         self.cache_dir = cache_dir
 
@@ -397,7 +428,7 @@ class CrazyflieInterface(object):
     @property
     def max_collective_thrust_m_s2(self):
         return (
-            4.0 * LEGACY_THRUST_MAX_PER_MOTOR_N / self.mass_kg
+            4.0 * self.thrust_scale_per_motor_n / self.mass_kg
         )
 
     @property
@@ -405,6 +436,7 @@ class CrazyflieInterface(object):
         result = collective_thrust_to_uint16(
             9.81,
             mass_kg=self.mass_kg,
+            thrust_max_per_motor_n=self.thrust_scale_per_motor_n,
         )
         return result["thrust_uint16"]
 
@@ -492,7 +524,7 @@ class CrazyflieInterface(object):
         print("R/P/Y mode: RATE / RATE / RATE")
         print("Mass: %.4f kg" % self.mass_kg)
         print(
-            "Legacy-prop max collective thrust: %.4f m/s^2"
+            "Calibrated command-range limit: %.4f m/s^2"
             % self.max_collective_thrust_m_s2
         )
         print(
@@ -536,6 +568,7 @@ class CrazyflieInterface(object):
         thrust = collective_thrust_to_uint16(
             collective_thrust_m_s2,
             mass_kg=self.mass_kg,
+            thrust_max_per_motor_n=self.thrust_scale_per_motor_n,
         )
 
         commander_roll, commander_pitch, commander_yaw = (
@@ -562,6 +595,10 @@ class CrazyflieInterface(object):
             ),
             "thrust_uint16": thrust["thrust_uint16"],
             "thrust_saturated": thrust["saturated"],
+            "command_scale_per_motor_N": thrust["command_scale_per_motor_N"],
+            "firmware_target_per_motor_thrust_N": (
+                thrust["firmware_target_per_motor_thrust_N"]
+            ),
             "commander_roll": commander_roll,
             "commander_pitch": commander_pitch,
             "commander_yaw": commander_yaw,
@@ -618,10 +655,14 @@ class CrazyflieInterface(object):
         self.close()
 
 
-def print_thrust_summary(mass_kg):
+def print_thrust_summary(
+    mass_kg,
+    thrust_scale_per_motor_n=DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N,
+):
     hover = collective_thrust_to_uint16(
         9.81,
         mass_kg=mass_kg,
+        thrust_max_per_motor_n=thrust_scale_per_motor_n,
     )
 
     max_accel = hover["max_collective_thrust_m_s2"]
@@ -629,6 +670,7 @@ def print_thrust_summary(mass_kg):
     print("Crazyflie thrust model summary")
     print("------------------------------")
     print("mass                    : %.4f kg" % mass_kg)
+    print("host command scale      : %.6f N/motor" % thrust_scale_per_motor_n)
     print(
         "legacy thrust max/motor : %.6f N"
         % LEGACY_THRUST_MAX_PER_MOTOR_N
@@ -643,7 +685,7 @@ def print_thrust_summary(mass_kg):
         % hover["thrust_uint16"]
     )
     print(
-        "max collective thrust   : %.6f m/s^2"
+        "calibrated range limit  : %.6f m/s^2"
         % max_accel
     )
     print(
@@ -673,8 +715,15 @@ def main():
     parser.add_argument(
         "--mass-g",
         type=float,
-        default=47.2,
-        help="all-up vehicle mass [g]; default 47.2",
+        default=DEFAULT_MASS_KG * 1000.0,
+        help="all-up vehicle mass [g]; default %(default)s",
+    )
+
+    parser.add_argument(
+        "--thrust-scale-per-motor-n",
+        type=float,
+        default=DEFAULT_THRUST_COMMAND_SCALE_PER_MOTOR_N,
+        help="empirical host thrust/command scale [N/motor]; default %(default)s",
     )
 
     parser.add_argument(
@@ -701,12 +750,13 @@ def main():
     args = parser.parse_args()
 
     mass_kg = args.mass_g / 1000.0
-    print_thrust_summary(mass_kg)
+    print_thrust_summary(mass_kg, args.thrust_scale_per_motor_n)
 
     interface = CrazyflieInterface(
         uri=args.uri,
         mass_kg=mass_kg,
         dry_run=not args.live,
+        thrust_scale_per_motor_n=args.thrust_scale_per_motor_n,
     )
 
     if args.live:

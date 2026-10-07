@@ -17,11 +17,10 @@ Use --live to actually send commands to the Crazyflie.
 import argparse
 import time
 
-from crazyflie_interface import CrazyflieInterface
+from crazyflie_interface import DEFAULT_MASS_KG, CrazyflieInterface
 
 
 DEFAULT_URI = "radio://0/100/2M"
-DEFAULT_MASS_KG = 0.0472
 
 
 def main():
